@@ -568,10 +568,11 @@ class GenericAgentHandler(BaseHandler):
             next_prompt = f"[Plan Hint] 正在计划模式。必须 file_read({_plan}) 确认当前步骤，回复开头引用：📌 当前步骤：...\n\n" + next_prompt
         if _plan and turn >= 90: next_prompt += f"\n\n[DANGER] Plan模式已运行 {turn} 轮，已达上限。必须 ask_user 汇报进度并确认是否继续。"
 
-        injkeyinfo = consume_file(self.parent.task_dir, '_keyinfo')
-        injprompt = consume_file(self.parent.task_dir, '_intervene')
+        injkeyinfo = getattr(self.parent, 'extrakeyinfo', None) or consume_file(self.parent.task_dir, '_keyinfo')
+        injprompt = getattr(self.parent, 'intervene', None) or consume_file(self.parent.task_dir, '_intervene')
         if injkeyinfo: self.working['key_info'] = self.working.get('key_info', '') + f"\n[MASTER] {injkeyinfo}"
         if injprompt: next_prompt += f"\n\n[MASTER] {injprompt}\n"
+        self.parent.intervene = self.parent.extrakeyinfo = None
         for hook in getattr(self.parent, '_turn_end_hooks', {}).values(): hook(locals())  # current readonly
         return next_prompt
 

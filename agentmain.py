@@ -261,13 +261,60 @@ if __name__ == '__main__':
         try: import readline
         except Exception: pass
         agent.inc_out = True
+        if sys.stdout.isatty():
+            try: model = agent.get_llm_name(model=True) or '?'
+            except Exception: model = '?'
+            try:
+                sys.stdout.write(f'\x1b[92m✦\x1b[0m \x1b[1mGenericAgent\x1b[0m '
+                                 f'\x1b[90m· cli · model:\x1b[0m {model}'
+                                 f'\x1b[90m · 运行中直接输入即可 steer 引导\x1b[0m\n')
+                sys.stdout.flush()
+            except Exception: pass
+
+        # steer：任务运行中输入的消息注入为中途引导（引擎在 ga.turn_end_callback
+        # 消费 agent.intervene，附加到下一轮 next_prompt）。与 tuiapp_v2 同一机制。
+        _STEER_WRAP = ("User sent a message while you were working:\n{text}\n"
+                       "Please take it into consideration and adjust direction if needed."
+                       if os.environ.get('GA_LANG') == 'en' else
+                       "用户在你工作时发来了一条新消息：\n{text}\n请将其纳入考虑，必要时调整方向。")
+        input_q = queue.Queue()
+        def _stdin_reader():
+            while True:
+                try: line = input('> ')
+                except (EOFError, KeyboardInterrupt): input_q.put(None); return
+                input_q.put(line)
+        threading.Thread(target=_stdin_reader, daemon=True).start()
+
+        def _steer(text):
+            wrapped = _STEER_WRAP.format(text=text)
+            agent.intervene = f"{agent.intervene}\n\n{wrapped}" if agent.intervene else wrapped
+            print(f'\n\x1b[96m[Steer]\x1b[0m 已注入引导，将在下一轮生效: {smart_format(text, max_str_len=80)}')
+
+        def _steer_replay(ctx):
+            # 退出轮被消费的引导会随 next_prompt 一并丢弃 → 重投为新任务，避免用户的话丢失
+            if ctx.get('exit_reason') and ctx.get('injprompt'):
+                agent.put_task(ctx['injprompt'], source='user')
+        hooks = getattr(agent, '_turn_end_hooks', None) or {}
+        agent._turn_end_hooks = hooks; hooks['cli_steer_replay'] = _steer_replay
+
+        def _drain_steers():
+            while True:
+                try: s = input_q.get_nowait()
+                except queue.Empty: return
+                if s and (s := s.strip()): _steer(s)
+
         while True:
-            q = input('> ').strip()
-            if not q: continue
+            q = input_q.get()
+            if q is None: break
+            if not (q := q.strip()): continue
+            if agent.is_running:
+                _steer(q); continue
             try:
                 dq = agent.put_task(q, source='user')
                 while True:
-                    item = dq.get()
+                    _drain_steers()
+                    try: item = dq.get(timeout=0.3)
+                    except queue.Empty: continue
                     if 'next' in item: print(item['next'], end='', flush=True)
                     if 'done' in item: print(); break
             except KeyboardInterrupt:
