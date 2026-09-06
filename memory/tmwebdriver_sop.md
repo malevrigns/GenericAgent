@@ -20,6 +20,8 @@
 
 ## Google图搜
 - class名混淆禁硬编码，点击结果用 `[role=button]` div
+- ⭐搜索结果批量抓取(✅已验证)：在已打开的google域tab上 `fetch('/search?q='+enc, {headers:{'Accept-Language':'zh-CN'}})` 同源无CORS，DOMParser解析取`body.innerText`；2-4查询/批串行、间隔≥500ms防限流；每查询文本截3000字防返回过大
+- ⚠web_execute_js里`window.open('file://...')`会被拦不跳转；本地文件用python `os.startfile()`开默认浏览器
 - web_scan过滤边栏，弹出后用JS：文本`document.body.innerText`，大图遍历img按`naturalWidth`最大取src
 - "访问"链接：遍历a找`textContent.includes('访问')`的href
 - 缩略图：`img[src^="data:image"]`直接提取；大图src可能截断用`return img.src`

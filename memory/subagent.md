@@ -35,6 +35,8 @@
 1. 主agent准备阶段：爬取/dump数据，存为多个独立输入文件
 2. 分发：对每个文件启动一个subagent处理（主agent自己也可以处理其中一个）
 3. 收集：等所有subagent完成，主agent读取各输出文件，汇总结果
+**⚠ --func会self-daemon**：Popen启动后原PID立即退出属正常(它fork出worker)，**禁用tasklist查原PID判断存活**。判完成=轮询`prompt.out.txt`出现`[ROUND END]`(或目标产物文件生成)。LLM写大文件较慢,单任务可达2-5min,别误判为卡死就重复重跑;某out.txt长期停在中间Turn无[ROUND END]=该实例真挂了,单独重跑即可。
+**⚠ 拼装LLM生成的HTML/CSS片段易破版**：子片段里的`<style>`块可能未闭合/错位/裸写CSS,只删配对`<style>`会漏CSS泄漏进body致标签失衡。稳健做法:按"首个`<style>`到最后一个`</style>`"整段抽为CSS并入head,body取最后`</style>`之后内容;拼完校验各标签开闭配平+body内无`.xxx{`裸选择器。
 
 ## subagent内部plan_mode使用
 **原则**：subagent本身是完整agent，接收多步骤任务时应在内部创建plan管理执行
