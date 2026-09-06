@@ -87,20 +87,66 @@ def safeprint(*argv):
     except OSError: pass
 print = safeprint
 
+STATS = {}
+
+_CJK_RE = re.compile(r'[぀-ヿ⺀-鿿가-힯豈-﫿︰-﹏＀-￯]')
+
+def estimate_tokens(text):
+    """保守估算 token 数（无外部依赖）。
+    CJK/全角 ~1.2 字符/token（Qwen 中文实际 ~1.5，留安全边际），
+    ASCII/其他 ~3.5 字符/token，emoji 等增补平面字符按 3 token/个。"""
+    if not text: return 0
+    cjk = len(_CJK_RE.findall(text))
+    astral = sum(1 for ch in text if ord(ch) > 0xFFFF)
+    return int(cjk / 1.2 + (len(text) - cjk - astral) / 3.5 + astral * 3)
+
+def _msg_tokens(m):
+    return estimate_tokens(json.dumps(m, ensure_ascii=False)) + 10  # role/结构开销
+
+def _clamp_oversized_blocks(history, token_budget, keep_from=0):
+    """最后防线：逐条截断超大文本块；仍超预算则从最早的可删消息整体丢弃（至少留 2 条）。"""
+    limit = max(256, token_budget // 6)  # 单块预算；按 1 token ≲ 1 字符保守截断
+    def _cut(s):
+        return s if len(s) <= limit else s[:limit//2] + '\n...[Truncated]...\n' + s[-limit//2:]
+    for m in history:
+        c = m.get('content')
+        blocks = c if isinstance(c, list) else ([{'type': 'text', 'text': c}] if isinstance(c, str) else [])
+        for b in blocks:
+            if not isinstance(b, dict): continue
+            for field in ('text', 'thinking'):
+                if isinstance(b.get(field), str) and len(b[field]) > limit: b[field] = _cut(b[field])
+            if b.get('type') == 'tool_result' and isinstance(b.get('content'), str) and len(b['content']) > limit:
+                b['content'] = _cut(b['content'])
+    while len(history) > 2 and sum(_msg_tokens(m) for m in history) > token_budget:
+        del history[keep_from if keep_from < len(history) - 2 else 0]
+
 def trim_messages_history(history, sess):
-    cap = sess.context_win * 3
+    # 预算按估算 token 计（旧版按字符×3，中文场景严重低估，曾导致 262K 窗口被撑爆）
+    cap = max(1024, sess.context_win - estimate_tokens(sess.system or '') - 1024)
     target = int(cap * getattr(sess, 'trim_keep_rate', 0.6))
-    def cost(): return sum(len(json.dumps(m, ensure_ascii=False)) for m in history)
-    compress_history_tags(history, interval=getattr(sess, 'cut_msg_interval', 5))
-    print(f'[Debug] Current context: {cost()} chars, {len(history)} messages.')
-    if cost() <= cap: return
+    kp = getattr(sess, 'trim_keep_prefix', 0)
+    def cost(ms): return sum(_msg_tokens(m) for m in ms)
+    compress_history_tags(history, interval=getattr(sess, 'cut_msg_interval', 7))
+    STATS.update(ctx=(c := cost(history)), msgs=len(history)); print(f'[Debug] Current context: ~{c} tokens, {len(history)} messages.')
+    if c <= cap: return
     compress_history_tags(history, keep_recent=4, force=True)
-    if cost() <= target: return
-    while len(history) > 9 and cost() > target:
-        history.pop(0)
-        while history and history[0].get('role') != 'user': history.pop(0)
-        if history and history[0].get('role') == 'user': history[0] = _sanitize_leading_user_msg(history[0])
-    print(f'[Debug] Trimmed context, current: {cost()} chars, {len(history)} messages.')
+    if cost(history) <= target: return
+    pre, post = history[:kp], history[kp:]; costs = [_msg_tokens(m) for m in post]; c = cost(pre) + sum(costs); i = 0
+    while len(post) - i > 9 and c > target:
+        c -= costs[i]; i += 1
+        while i < len(post) and post[i].get('role') != 'user': c -= costs[i]; i += 1
+        if i < len(post): old = costs[i]; post[i] = _sanitize_leading_user_msg(post[i]); costs[i] = _msg_tokens(post[i]); c += costs[i] - old
+    post = post[i:]
+    if kp and pre:
+        m = pre[-1]
+        if m.get('role') == 'assistant' and isinstance(m.get('content'), list):
+            m['content'] = [b for b in m['content'] if not (isinstance(b, dict) and b.get('type') == 'tool_use')] or [{"type": "text", "text": "..."}]
+        _d = lambda: [{"type": "text", "text": "..."}]
+        gap = [{"role": "assistant", "content": _d()}] if m.get('role') == 'user' else [{"role": "user", "content": _d()}, {"role": "assistant", "content": _d()}]
+        history[:] = pre + gap + post
+    else: history[:] = pre + post
+    if cost(history) > cap: _clamp_oversized_blocks(history, cap, keep_from=kp)
+    STATS.update(ctx=(c := cost(history)), msgs=len(history)); print(f'[Debug] Trimmed context, current: ~{c} tokens, {len(history)} messages.')
 
 def auto_make_url(base, path):
     b, p = base.rstrip('/'), path.strip('/')
@@ -281,6 +327,9 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
                 if tc.get("id") and not tc_buf[idx]["id"]: tc_buf[idx]["id"] = tc["id"]
             usage = evt.get("usage")
             if usage: _record_usage(usage, api_mode)
+            if ch.get("finish_reason") == "length":
+                print("[WARN] Response truncated: max_tokens (思考+正文共享预算，被服务端截断)")
+                content_text += "\n\n[!!! Response truncated: max_tokens !!!]"
         blocks = []
         if reasoning_text: blocks.append({"type": "thinking", "thinking": reasoning_text})
         if content_text: blocks.append({"type": "text", "text": content_text})
@@ -407,8 +456,12 @@ def _openai_stream(sess, messages):
         payload = {"model": model, "messages": messages, "stream": sess.stream}
         if sess.stream: payload["stream_options"] = {"include_usage": True}
         if temperature != 1: payload["temperature"] = temperature
+        if getattr(sess, 'top_p', None) is not None: payload["top_p"] = sess.top_p
+        if getattr(sess, 'top_k', None) is not None: payload["top_k"] = sess.top_k
+        if getattr(sess, 'repetition_penalty', None) is not None: payload["repetition_penalty"] = sess.repetition_penalty
         if sess.max_tokens: payload["max_completion_tokens" if ml.startswith(("gpt-5", "o1", "o2", "o3", "o4")) else "max_tokens"] = sess.max_tokens
         if sess.reasoning_effort: payload["reasoning_effort"] = sess.reasoning_effort
+        if getattr(sess, 'chat_template_kwargs', None): payload["chat_template_kwargs"] = sess.chat_template_kwargs
     tools = getattr(sess, 'tools', None)
     if tools: payload["tools"] = _prepare_oai_tools(tools, api_mode)
     if sess.service_tier: payload["service_tier"] = sess.service_tier
@@ -537,7 +590,13 @@ class BaseSession:
         mode = str(cfg.get('api_mode', 'chat_completions')).strip().lower().replace('-', '_')
         self.api_mode = 'responses' if mode in ('responses', 'response') else 'chat_completions'
         self.temperature = cfg.get('temperature', 1)
+        self.top_p = cfg.get('top_p')
+        self.top_k = cfg.get('top_k')
+        self.repetition_penalty = cfg.get('repetition_penalty')
         self.max_tokens = cfg.get('max_tokens')
+        self.chat_template_kwargs = cfg.get('chat_template_kwargs')  # e.g. {'enable_thinking': True} for SGLang-hosted Qwen
+        self.default_ua = "claude-cli/2.1.152 (external, cli)"
+        self.user_agent = cfg.get("user_agent", self.default_ua)
     def _apply_claude_thinking(self, payload):
         if self.thinking_type:
             thinking = {"type": self.thinking_type}
@@ -757,9 +816,33 @@ class ToolClient:
         gen = self.backend.ask(full_prompt)
         _write_llm_log('Prompt', full_prompt, self.log_path)
         raw_text = ''
+        # 流式循环检测：服务器端 repetition_penalty 在部分构建里不生效（实测 vendor PPU build
+        # 丢弃 rep/freq/presence penalty），思考型小模型会陷入复读直到 max_tokens。此处发现
+        # 同一长片段在近期输出里反复出现即中止流，让上层按错误重试。
+        # 阈值放宽：长任务（批量网页操作、代码生成）中合法输出也常重复相似结构，
+        # 需要更大的窗口、更长的重复单元、更多重复次数和更高覆盖率才判定为失控复读。
+        _LOOP_WIN, _LOOP_MIN, _LOOP_DUP, _LOOP_COVER = 600, 80, 5, 0.85
+        _recent = ''; _scanned_at = 0; _abort = None
         for chunk in gen:
-            raw_text += chunk; yield chunk
-        _write_llm_log('Response', raw_text, self.log_path)
+            raw_text += chunk
+            _recent = (_recent + chunk)[-_LOOP_WIN * 2:]
+            if len(_recent) > _LOOP_WIN and len(_recent) - _scanned_at >= 24:
+                _scanned_at = len(_recent)
+                probe = _recent[-_LOOP_WIN:]
+                for L in range(_LOOP_MIN, min(len(_recent) // 3, 240) + 1):
+                    unit = _recent[-L:]
+                    cnt = _recent.count(unit)
+                    if cnt >= _LOOP_DUP and cnt * L >= _LOOP_COVER * len(probe):
+                        _abort = (unit[:80], L, cnt); break
+                if _abort: break
+            yield chunk
+        if _abort:
+            unit, L, cnt = _abort
+            print(f"[WARN] Repetition loop detected (unit {L} chars x{cnt}): {unit!r} — aborting stream for retry")
+            _write_llm_log('Response(loop-aborted)', raw_text, self.log_path, model=self.backend.model)
+            # 合成一条带错误标记的回复：do_no_tool 的 '!!!Error:' 检测会触发强制重试而非终局
+            return MockResponse('', f"[Repetition loop aborted: 同一片段重复{cnt}次，服务器惩罚参数失效被流式检测截断。 !!!Error: repetition loop]", [], raw_text)
+        _write_llm_log('Response', raw_text, self.log_path, model=self.backend.model)
         return self._parse_mixed_response(raw_text)
 
     def _prepare_tool_instruction(self, tools):
@@ -783,9 +866,35 @@ Follow these steps to think and act:
 2. **总结**: 在 `<summary>` 中输出*极为简短*的高度概括的单行（<30字）物理快照，包括上次工具调用结果产生的新信息+本次工具调用意图。此内容将进入长期工作记忆，记录关键信息，严禁输出无实际信息增量的描述。
 3. **行动**: 如需调用工具，请在回复正文之后输出一个（或多个）**<tool_use>块**，然后结束。
 """
-        tool_instruction += f'\nFormat: ```<tool_use>{{"name": "tool_name", "arguments": {{...}}}}</tool_use>```\n\n### Tools (mounted, always in effect):\n{tools_json}\n'
+        if _en:
+            tool_instruction += (
+                '\nFormat: ```<tool_use>{"name": "tool_name", "arguments": {...}}</tool_use>```\n'
+                'Hard output requirements (violations break the parser and abort the task):\n'
+                '- Each <tool_use> block contains exactly ONE complete JSON object; before finishing, verify every { has a matching }, every [ a matching ], strings use double quotes, and literal newlines inside strings are written as \\n.\n'
+                '- Nothing else may appear inside or after the block: no </script>, no backticks, no other tags, no duplicate </tool_use>.\n'
+                '- After the closing </tool_use>, stop generating immediately — no repeated closing tags, no trailing explanation.\n'
+                '\nExample of a standard turn:\n'
+                'You output: <summary>got dir listing, next read config</summary> (your analysis…) ```<tool_use>{"name": "file_read", "arguments": {"path": "a.txt"}}</tool_use>```\n'
+                'The system then returns: <tool_result>file content…</tool_result>, and you continue analyzing or issue the next call.\n'
+                f'\n### Tools (mounted, always in effect):\n{tools_json}\n'
+            )
+        else:
+            tool_instruction += (
+                '\n格式: ```<tool_use>{"name": "工具名", "arguments": {...}}</tool_use>```\n'
+                '输出硬性要求（违反会导致解析失败、任务中断）：\n'
+                '- 每个 <tool_use> 块内只放一个完整 JSON 对象；结束前自检：每个 { 都有对应的 }，每个 [ 都有对应的 ]，字符串一律双引号，字符串内的换行必须写成 \\n。\n'
+                '- 块内和块后不得出现任何其他内容：不要 </script>，不要反引号，不要其他标签，不要重复 </tool_use>。\n'
+                '- 输出闭合的 </tool_use> 后立刻停止生成：不重复闭合标签、不追加任何解释。\n'
+                '\n标准回合示例：\n'
+                '你的输出: <summary>已获目录列表，下一步读配置文件</summary>（正文分析……）```<tool_use>{"name": "file_read", "arguments": {"path": "a.txt"}}</tool_use>```\n'
+                '随后系统返回: <tool_result>文件内容……</tool_result>，你再继续分析或发起下一次调用。\n'
+                f'\n### 工具列表 (已挂载，持续有效):\n{tools_json}\n'
+            )
         if self.auto_save_tokens and self.last_tools == tools_json:
-            tool_instruction = "\n### Tools: still active, **ready to call**. Protocol unchanged.\n" if _en else "\n### 工具库状态：持续有效（code_run/file_read等），**可正常调用**。调用协议沿用。\n"
+            tool_instruction = ("\n### Tools: still active, **ready to call**. Protocol unchanged. "
+                "Format: <tool_use>{\"name\": \"...\", \"arguments\": {...}}</tool_use> — JSON braces must balance; stop right after </tool_use>; no extra tags/backticks.\n" if _en else
+                "\n### 工具库状态：持续有效（code_run/file_read等），**可正常调用**。调用协议沿用。"
+                "格式：<tool_use>{\"name\": \"...\", \"arguments\": {...}}</tool_use>，JSON 括号必须配对，</tool_use> 后立即停止，禁止多余标签/反引号。\n")
         else: self.total_cd_tokens = 0
         self.last_tools = tools_json
         return tool_instruction
@@ -864,6 +973,22 @@ def _parse_text_tool_calls(content):
             if name: tcs.append(MockToolCall(name, args))
         except: pass
     if tcs: content = re.sub(_xp, "", content, flags=re.DOTALL).strip()
+    # qwen3-coder style: <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+    # (server-side tool-call parser can miss these when the model emits malformed tags,
+    #  leaving the call as plain text; without this fallback the agent treats the turn as done)
+    _fp = re.compile(r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>", re.DOTALL)
+    _pp = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
+    for _name, _fbody in _fp.findall(content):
+        _args = {}
+        for _key, _val in _pp.findall(_fbody):
+            _key = _key.strip(); _val = _val.strip()
+            _stray = '</' + _key + '>'  # model sometimes closes with the key name instead of </parameter>
+            if _val.endswith(_stray): _val = _val[:-len(_stray)].rstrip()
+            try: _val = json.loads(_val)
+            except Exception: pass
+            _args[_key] = _val
+        tcs.append(MockToolCall(_name.strip(), _args))
+    if tcs: content = _fp.sub("", content).strip()
     return tcs, content
 
 def _ensure_text_block(blocks):
@@ -876,19 +1001,67 @@ def _ensure_text_block(blocks):
     blocks.insert(1, {"type": "text", "text": txt})
     return txt
 
-def _write_llm_log(label, content, log_path=None):
+def _write_llm_log(label, content, log_path=None, model=''):
     if not log_path:
         log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'temp/model_responses/model_responses_{os.getpid()}.txt')
     os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with open(log_path, 'a', encoding='utf-8', errors='replace') as f:
-        f.write(f"=== {label} === {ts}\n{content}\n\n")
+        f.write(f"=== {label} === {ts}{model}\n{content}\n\n")
+
+def _json_repair(s, max_iter=40):
+    r"""Best-effort repair of near-JSON that json.loads rejects on escapes/tail:
+    invalid escapes (\1 \s \w — Python regex fragments in string args), raw control
+    chars, model escaping its own closing quote, or truncation mid-string."""
+    def _scan(s, end):  # container/string state over s[:end]
+        stack, i, instr, esc = [], 0, False, False
+        while i < end:
+            c = s[i]
+            if instr:
+                if esc: esc = False
+                elif c == '\\': esc = True
+                elif c == '"': instr = False
+            elif c == '"': instr = True
+            elif c in '[{': stack.append(c)
+            elif c in ']}':
+                if stack and ((c == ']' and stack[-1] == '[') or (c == '}' and stack[-1] == '{')): stack.pop()
+                # mismatched closer: leave stack so repair re-closes the still-open container
+            i += 1
+        return stack, instr, esc
+    def _close_open(s):  # close unterminated string + whatever containers are open
+        stack, instr, esc = _scan(s, len(s))
+        if not stack and not instr and not esc: return None
+        return s + ('"' if instr or esc else '') + ''.join(']' if c == '[' else '}' for c in reversed(stack))
+    for _ in range(max_iter):
+        try: return json.loads(s)
+        except json.JSONDecodeError as e:
+            if e.pos is None or e.pos > len(s): raise
+            if e.msg == 'Invalid \\escape' and s[e.pos] == '\\':
+                s = s[:e.pos] + '\\' + s[e.pos:]  # double the stray backslash
+            elif e.msg.startswith('Invalid control character') and s[e.pos] in '\n\r\t':
+                s = s[:e.pos] + {'\n': '\\n', '\r': '\\r', '\t': '\\t'}[s[e.pos]] + s[e.pos + 1:]
+            elif e.msg.startswith('Unterminated string'):
+                if s.endswith('\\"'): s = s[:-2] + '"'  # model escaped its own closing quote
+                else:  # truncated mid-string: close it plus whatever containers are open
+                    s = _close_open(s) or (_ for _ in ()).throw(e)
+            elif e.msg == "Expecting ',' delimiter" and e.pos < len(s) and s[e.pos] in ']}':
+                # closer for an inner container omitted before an outer one: insert the right closer
+                st, _, _ = _scan(s, e.pos)
+                if not st: raise
+                s = s[:e.pos] + (']' if st[-1] == '[' else '}') + s[e.pos:]
+            elif e.pos >= len(s) - 1 and (s2 := _close_open(s)) is not None:
+                # structure truncated at end (e.g. missing closing brace): close open containers
+                s = s2
+            else: raise
+    raise ValueError('unrepairable json')
 
 def tryparse(json_str):
     try: return json.loads(json_str)
     except: pass
     json_str = json_str.strip().strip('`').replace('json\n', '', 1).strip()
     try: return json.loads(json_str)
+    except: pass
+    try: return _json_repair(json_str)  # before truncations: keeps content intact
     except: pass
     try: return json.loads(json_str[:-1])
     except: pass
