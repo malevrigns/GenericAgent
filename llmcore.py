@@ -90,15 +90,20 @@ print = safeprint
 STATS = {}
 
 _CJK_RE = re.compile(r'[぀-ヿ⺀-鿿가-힯豈-﫿︰-﹏＀-￯]')
+# 长段无空白 ASCII（base64/hex/长密钥等）：BPE 几乎合并不了，分词效率远低于普通英文
+_DENSE_ASCII_RE = re.compile(r'[A-Za-z0-9+/=_\-]{64,}')
 
 def estimate_tokens(text):
     """保守估算 token 数（无外部依赖）。
     CJK/全角 ~1.2 字符/token（Qwen 中文实际 ~1.5，留安全边际），
-    ASCII/其他 ~3.5 字符/token，emoji 等增补平面字符按 3 token/个。"""
+    普通 ASCII ~3.5 字符/token，致密 ASCII 串(base64等) ~1.8 字符/token，
+    emoji 等增补平面字符按 3 token/个。"""
     if not text: return 0
     cjk = len(_CJK_RE.findall(text))
     astral = sum(1 for ch in text if ord(ch) > 0xFFFF)
-    return int(cjk / 1.2 + (len(text) - cjk - astral) / 3.5 + astral * 3)
+    dense = sum(len(m.group(0)) for m in _DENSE_ASCII_RE.finditer(text))
+    normal = len(text) - cjk - astral - dense
+    return int(cjk / 1.2 + normal / 3.5 + dense / 1.8 + astral * 3)
 
 def _msg_tokens(m):
     return estimate_tokens(json.dumps(m, ensure_ascii=False)) + 10  # role/结构开销
