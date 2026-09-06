@@ -280,6 +280,8 @@ class GenericAgentHandler(BaseHandler):
 
     def do_code_run(self, args, response):
         '''执行代码片段，有长度限制，不允许代码中放大量数据，如有需要应当通过文件读取进行。'''
+        self._reset_empty_ct()  # 模型重新干活了 → 连续空转计数清零
+        self._any_tool_ran = True
         code_type = args.get("type", "python")
         code = args.get("code") or args.get("script")
         if not code:
@@ -372,6 +374,7 @@ class GenericAgentHandler(BaseHandler):
     def do_file_write(self, args, response):
         '''用于对整个文件的大量处理，精细修改要用file_patch。
         需要将要写入的内容放在<file_content>标签内，或者放在代码块中'''
+        self._reset_empty_ct(); self._any_tool_ran = True
         path = self._get_abs_path(args.get("path", ""))
         mode = args.get("mode", "overwrite")  # overwrite/append/prepend
         action_str = {"prepend": "Prepending to", "append": "Appending to"}.get(mode, "Overwriting")
@@ -448,6 +451,8 @@ class GenericAgentHandler(BaseHandler):
         self._empty_ct = getattr(self, '_empty_ct', 0) + 1
         if self._empty_ct >= 3: return StepOutcome({}, should_exit=True)
         return StepOutcome({}, next_prompt=prompt)
+    def _reset_empty_ct(self):
+        self._empty_ct = 0
 
     def do_no_tool(self, args, response):
         '''这是一个特殊工具，由引擎自主调用，不要包含在TOOLS_SCHEMA里。
@@ -462,6 +467,14 @@ class GenericAgentHandler(BaseHandler):
             return self._retry_or_exit("[System] Incomplete response. Regenerate and tooluse.")
         if 'max_tokens !!!]' in content[-100:]:
             return self._retry_or_exit("[System] max_tokens limit reached. Use multi small steps to do it.")
+        # Qwen 等小模型 temp 波动下偶发"只说不做"：宣布行动意图却一个工具都不调 →
+        # 这不是给用户的最终答复，是过早停机。识别意图标记且无完成标记时强制重试。
+        if not self._in_plan_mode() and len(content) < 600:
+            _intent = re.search(r'(我将|我会|我将要|让我|接下来|下一步|现在开始|先.{0,25}再.{0,25}最后|I will|I\'ll|Let me|First,? I)', content)
+            _done = re.search(r'(任务完成|全部完成|已完成|汇总如下|如下：|如下:|✅|🏁)', content)
+            if _intent and not _done:
+                yield "[Warn] 模型宣布行动意图但未调用任何工具 → 强制重试。\n"
+                return self._retry_or_exit("[System] 你上一轮宣布了要执行的操作，但没有调用任何工具，任务远未完成。请立即调用工具（code_run/file_write/file_read 等）实际执行下一步，禁止只输出文字计划。")
         
         if self._in_plan_mode() and any(kw in content for kw in ['任务完成', '全部完成', '已完成所有', '🏁']):
             if 'VERDICT' not in content and '[VERIFY]' not in content and '验证subagent' not in content:
@@ -475,21 +488,23 @@ class GenericAgentHandler(BaseHandler):
         if len(blocks) == 1:
             m = re.search(code_block_pattern, content)
             after_block = content[m.end():]
-            if not after_block.strip():
-                residual = content.replace(m.group(0), "")
-                residual = re.sub(r"<thinking>[\s\S]*?</thinking>", "", residual, flags=re.IGNORECASE)
-                residual = re.sub(r"<summary>[\s\S]*?</summary>", "", residual, flags=re.IGNORECASE)
-                clean_residual = re.sub(r"\s+", "", residual)
-                if len(clean_residual) <= 30:
-                    yield "[Info] Detected large code block without tool call and no extra natural language. Requesting clarification.\n"
-                    next_prompt = (
-                        "[System] 检测到你在上一轮回复中主要内容是较大代码块，且本轮未调用任何工具。\n"
-                        "如果这些代码需要执行、写入文件或进一步分析，请重新组织回复并显式调用相应工具"
-                        "（例如：code_run、file_write、file_patch 等）；\n"
-                        "如果只是向用户展示或讲解代码片段，请在回复中补充自然语言说明，"
-                        "并明确是否还需要额外的实际操作。"
-                    )
-                    return StepOutcome({}, next_prompt=next_prompt)
+            residual = content.replace(m.group(0), "")
+            residual = re.sub(r"<thinking>[\s\S]*?</thinking>", "", residual, flags=re.IGNORECASE)
+            residual = re.sub(r"<summary>[\s\S]*?</summary>", "", residual, flags=re.IGNORECASE)
+            clean_residual = re.sub(r"\s+", "", residual)
+            code_lang = m.group(0).split('\n', 1)[0].replace('```', '').strip().lower()
+            # 可执行语言的大代码块 + 无工具调用 + 任务未完成 → 不管周围解释文字多少都拦截：
+            # "补充自然语言说明"式绕过（解释一大段+代码裸放正文）实际什么都没执行。
+            exec_langs = ('python', 'py', 'powershell', 'ps1', 'bash', 'sh', 'javascript', 'js', 'node')
+            task_started = getattr(self, '_any_tool_ran', False)
+            if not after_block.strip() and (len(clean_residual) <= 30 or (code_lang in exec_langs and task_started)):
+                yield "[Info] Detected large code block without tool call. Requesting execution.\n"
+                next_prompt = (
+                    "[System] 检测到你在上一轮回复中包含了较大的可执行代码块，但没有调用任何工具，代码并没有被执行。\n"
+                    "请立即调用 code_run（或 file_write 后执行）实际运行这段代码；"
+                    "如确认只是讲解无需执行，请在回复中明确声明【无需执行】。"
+                )
+                return StepOutcome({}, next_prompt=next_prompt)
                 
         if self._in_plan_mode():
             remaining = self._check_plan_completion()
