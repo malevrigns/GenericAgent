@@ -118,8 +118,17 @@ class GenericAgent:
             setattr(self.llmclient.backend, k, v)
             display_queue.put({'done': smart_format(f"✅ session.{k} = {repr(v)}", max_str_len=500), 'source': 'system'})
             return None
-        if raw_query.strip() == '/resume':
-            return r'帮我看看最近有哪些会话可以恢复。读model_responses/目录，按修改时间取最近10个文件，从每个文件里找最后一个<history>...</history>块，用一句话总结每个会话在聊什么，列表给我选。注意读文件后要把字面的\n替换成真换行才能正确匹配。'
+        if re.fullmatch(r'/resume(\s+\d+)?', raw_query.strip()):
+            # 直接列出/恢复历史会话，不经 LLM（旧实现是把日志检索任务甩给模型，慢且烧 token）。
+            # 已 install continue_cmd 的前端会在更外层拦截，这里是裸 agentmain/CLI 的兜底。
+            try:
+                try: import continue_cmd
+                except ImportError:
+                    sys.path.append(os.path.join(script_dir, 'frontends')); import continue_cmd
+                return continue_cmd.handle(self, re.sub(r'^/resume', '/continue', raw_query.strip()), display_queue)
+            except Exception as e:
+                display_queue.put({'done': f'❌ /resume 失败: {e}', 'source': 'system'})
+                return None
         return raw_query
 
     def run(self):

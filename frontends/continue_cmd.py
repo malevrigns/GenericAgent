@@ -214,12 +214,12 @@ def restore(agent, path):
     return f'⚠️ 非 native 格式，已降级恢复 {n} 轮摘要（{name}）\n(请输入新问题继续)', False
 
 def handle(agent, query, display_queue):
-    """Dispatch /continue or /continue N. Returns None if consumed else original query."""
+    """Dispatch /continue (alias /resume) or /continue N. Returns None if consumed else original query."""
     s = (query or '').strip()
-    if s == '/continue':
+    if s in ('/continue', '/resume'):
         display_queue.put({'done': format_list(list_sessions(exclude_pid=os.getpid())), 'source': 'system'})
         return None
-    m = re.match(r'/continue\s+(\d+)\s*$', s)
+    m = re.match(r'/(?:continue|resume)\s+(\d+)\s*$', s)
     if m:
         sessions = list_sessions(exclude_pid=os.getpid())
         idx = int(m.group(1)) - 1
@@ -285,12 +285,12 @@ def extract_ui_messages(path):
 
 
 def handle_frontend_command(agent, query, exclude_pid=None):
-    """Frontend-friendly /continue entry that returns text directly."""
+    """Frontend-friendly /continue (alias /resume) entry that returns text directly."""
     s = (query or '').strip()
     exclude_pid = os.getpid() if exclude_pid is None else exclude_pid
-    if s == '/continue':
+    if s in ('/continue', '/resume'):
         return format_list(list_sessions(exclude_pid=exclude_pid))
-    m = re.match(r'/continue\s+(\d+)\s*$', s)
+    m = re.match(r'/(?:continue|resume)\s+(\d+)\s*$', s)
     if not m:
         return '用法: /continue 或 /continue N'
     sessions = list_sessions(exclude_pid=exclude_pid)
@@ -303,11 +303,11 @@ def handle_frontend_command(agent, query, exclude_pid=None):
 
 
 def install(cls):
-    """Wrap cls._handle_slash_cmd so /continue is handled before original dispatch."""
+    """Wrap cls._handle_slash_cmd so /continue (alias /resume) is handled before original dispatch."""
     orig = cls._handle_slash_cmd
     if getattr(orig, '_continue_patched', False): return
     def patched(self, raw_query, display_queue):
-        if (raw_query or '').startswith('/continue'):
+        if (raw_query or '').startswith(('/continue', '/resume')):
             r = handle(self, raw_query, display_queue)
             if r is None: return None
         return orig(self, raw_query, display_queue)

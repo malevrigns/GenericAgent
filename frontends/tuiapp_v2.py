@@ -852,6 +852,7 @@ class GenericAgentTUI(App[None]):
             "branch": self._cmd_branch, "rewind": self._cmd_rewind, "clear": self._cmd_clear,
             "stop": self._cmd_stop, "llm": self._cmd_llm, "export": self._cmd_export,
             "restore": self._cmd_restore, "btw": self._cmd_btw, "continue": self._cmd_continue,
+            "resume": self._cmd_continue,
             "quit": self._cmd_quit, "exit": self._cmd_quit,
         }
 
@@ -1538,7 +1539,7 @@ class GenericAgentTUI(App[None]):
 
     def _cmd_continue(self, args, raw):
         sess = self.current
-        m = re.match(r"/continue\s+(\d+)\s*$", (raw or "").strip())
+        m = re.match(r"/(?:continue|resume)\s+(\d+)\s*$", (raw or "").strip())
         if m:
             sessions = continue_list(exclude_pid=os.getpid())
             idx = int(m.group(1)) - 1
