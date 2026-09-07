@@ -125,19 +125,29 @@ def _clamp_oversized_blocks(history, token_budget, keep_from=0):
     while len(history) > 2 and sum(_msg_tokens(m) for m in history) > token_budget:
         del history[keep_from if keep_from < len(history) - 2 else 0]
 
-def trim_messages_history(history, sess):
+_CTX_OVERFLOW_RE = re.compile(r'context_length_exceeded|maximum context length|max_model_len|exceeds?\s+the\s+maximum|maximum sequence length|longer than the specified maximum|context length|reduce the length', re.I)
+
+def is_ctx_overflow_error(text):
+    """判定服务端上下文超限错误（HTTP 400 等），用于触发强制压缩后重试。"""
+    return isinstance(text, str) and text.lstrip().startswith(('!!!Error:', '[Error:')) and bool(_CTX_OVERFLOW_RE.search(text))
+
+def trim_messages_history(history, sess, force=False):
     # 预算按估算 token 计（旧版按字符×3，中文场景严重低估，曾导致 262K 窗口被撑爆）
-    cap = max(1024, sess.context_win - estimate_tokens(sess.system or '') - 1024)
-    target = int(cap * getattr(sess, 'trim_keep_rate', 0.6))
+    # 服务端按 prompt+max_tokens 合计校验窗口（SGLang/vLLM 均如此），预算必须先扣回复额度；
+    # 之前没扣，导致 context_win=240000+max_tokens=32768 超过 262144，落入 229K~239K 的请求必被 400
+    reserve = min(getattr(sess, 'max_tokens', 0) or 0, sess.context_win // 4)
+    cap = max(1024, sess.context_win - estimate_tokens(sess.system or '') - reserve - 1024)
+    target = int(cap * (0.45 if force else getattr(sess, 'trim_keep_rate', 0.6)))
     kp = getattr(sess, 'trim_keep_prefix', 0)
     def cost(ms): return sum(_msg_tokens(m) for m in ms)
     compress_history_tags(history, interval=getattr(sess, 'cut_msg_interval', 7))
     STATS.update(ctx=(c := cost(history)), msgs=len(history)); print(f'[Debug] Current context: ~{c} tokens, {len(history)} messages.')
-    if c <= cap: return
+    if c <= cap and not force: return
     compress_history_tags(history, keep_recent=4, force=True)
-    if cost(history) <= target: return
+    if cost(history) <= target and not force: return
     pre, post = history[:kp], history[kp:]; costs = [_msg_tokens(m) for m in post]; c = cost(pre) + sum(costs); i = 0
-    while len(post) - i > 9 and c > target:
+    # force 模式（服务端已判定超限、估算不再可信）：无视 target 直接砍到最少保留 9 条
+    while len(post) - i > 9 and (c > target or force):
         c -= costs[i]; i += 1
         while i < len(post) and post[i].get('role') != 'user': c -= costs[i]; i += 1
         if i < len(post): old = costs[i]; post[i] = _sanitize_leading_user_msg(post[i]); costs[i] = _msg_tokens(post[i]); c += costs[i] - old
@@ -621,10 +631,23 @@ class BaseSession:
                 trim_messages_history(self.history, self)
                 messages = self.make_messages(self.history)
             content_blocks = None; content = ''
-            gen = self.raw_ask(messages)
-            try:
-                while True: chunk = next(gen); content += chunk; yield chunk
-            except StopIteration as e: content_blocks = e.value or []
+            for _attempt in (1, 2):
+                gen = self.raw_ask(messages)
+                try: first = next(gen)
+                except StopIteration as e: first, content_blocks = None, (e.value or [])
+                if _attempt == 1 and (is_ctx_overflow_error(first) or (content_blocks and is_ctx_overflow_error(next((b.get('text') for b in content_blocks if isinstance(b, dict) and b.get('type') == 'text'), '')))):
+                    # 服务端判定上下文超限（估算偏低时预防性裁剪可能没触发）：强制深度压缩后透明重试一次
+                    print("[Context Guard] 上下文超限被服务端拒绝，强制压缩历史后重试。")
+                    with self.lock:
+                        trim_messages_history(self.history, self, force=True)
+                        messages = self.make_messages(self.history)
+                    content_blocks = None; content = ''
+                    continue
+                if first: content += first; yield first
+                try:
+                    while True: chunk = next(gen); content += chunk; yield chunk
+                except StopIteration as e: content_blocks = e.value or []
+                break
             if len(content_blocks) > 1: print(f"[DEBUG BaseSession.ask] content_blocks: {content_blocks}")
             for block in (content_blocks or []):
                 if block.get('type', '') == 'tool_use':
@@ -744,10 +767,23 @@ class NativeClaudeSession(BaseSession):
             trim_messages_history(self.history, self)
             messages = [{"role": m["role"], "content": list(m["content"])} for m in self.history]
         content_blocks = None
-        gen = self.raw_ask(messages)
-        try:
-            while True: yield next(gen)
-        except StopIteration as e: content_blocks = e.value or []
+        for _attempt in (1, 2):
+            gen = self.raw_ask(messages)
+            try: first = next(gen)
+            except StopIteration as e: first, content_blocks = None, (e.value or [])
+            if _attempt == 1 and (is_ctx_overflow_error(first) or (content_blocks and is_ctx_overflow_error(next((b.get('text') for b in content_blocks if isinstance(b, dict) and b.get('type') == 'text'), '')))):
+                # 服务端判定上下文超限：强制深度压缩后透明重试一次（错误块不流出、不入历史）
+                print("[Context Guard] 上下文超限被服务端拒绝，强制压缩历史后重试。")
+                with self.lock:
+                    trim_messages_history(self.history, self, force=True)
+                    messages = [{"role": m["role"], "content": list(m["content"])} for m in self.history]
+                content_blocks = None
+                continue
+            if first: yield first
+            try:
+                while True: yield next(gen)
+            except StopIteration as e: content_blocks = e.value or []
+            break
         if content_blocks and (_injected := _ensure_text_block(content_blocks)): yield _injected
         if content_blocks and not (len(content_blocks) == 1 and content_blocks[0].get("text", "").startswith("!!!Error:")):
             self.history.append({"role": "assistant", "content": content_blocks})
