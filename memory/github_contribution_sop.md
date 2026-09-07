@@ -115,3 +115,12 @@ code_run('bash', 'gh pr status')
 code_run('bash', 'gh pr checks PR_NUMBER')
 code_run('bash', 'gh pr view PR_NUMBER --comments')
 ```
+
+## 附：无 gh CLI 时新建自己的 repo 并发布（Windows，2026-09 实测）
+适用：本机没装 `gh`、要发自己账号下的新 repo（非 fork/PR）。
+1. **git 路径**：`C:\Program Files\Git\cmd\git.exe`（shell 引号转义易坏，用 `[GIT]+args` list 形式调 subprocess）。
+2. **身份**：全局常未配 → commit 报 "Author identity unknown"；给单 repo 设 `git config user.name/email` 即可（不必 global）。
+3. **取 token**：`git credential fill`(stdin: `protocol=https\nhost=github.com\n`) → stdout 里 `password=` 即 PAT。**会偶发超时**，重试即可。
+4. **建 repo**：REST `POST /user/repos {name,description,private:false,auto_init:false}`。
+5. **⚠ push 443 被 reset 的兜底**：`git push` 走 smart-HTTP(443) 可能被网络/代理 reset（`Recv failure: Connection was reset`），而 REST API(同 443) 却通 → **改用 GitHub Contents API 逐文件 PUT** `/repos/{o}/{r}/contents/{path}`（body: `{content:base64,message}`）完全绕开 git push。public repo 可**匿名 GET** 验证远端 tree/commits，无需 token。
+6. **commit message** 记得追加 `Co-Authored-By: GenericAgent <bot@gaagent.ai>`。
