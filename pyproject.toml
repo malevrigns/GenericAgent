@@ -23,6 +23,12 @@ ui = [
     "pywebview>=4.0",
     "textual>=0.70",
 ]
+# exact-token counting for trim budgets (llmcore loads temp/qwen_tokenizer/
+# tokenizer.json or $GA_TOKENIZER_DIR); without it llmcore falls back to the
+# char-based estimator, so this stays optional.
+exact-tokens = [
+    "tokenizers>=0.15",
+]
 all-frontends = [
     "python-telegram-bot>=20.0",
     "qq-botpy>=1.0",
