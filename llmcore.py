@@ -94,7 +94,7 @@ _CJK_RE = re.compile(r'[぀-ヿ⺀-鿿가-힯豈-﫿︰-﹏＀-￯]')
 _DENSE_ASCII_RE = re.compile(r'[A-Za-z0-9+/=_\-]{64,}')
 
 def estimate_tokens(text):
-    """保守估算 token 数（无外部依赖）。
+    """保守估算 token 数（无外部依赖）。仅作分词器缺失时的兜底：
     CJK/全角 ~1.2 字符/token（Qwen 中文实际 ~1.5，留安全边际），
     普通 ASCII ~3.5 字符/token，致密 ASCII 串(base64等) ~1.8 字符/token，
     emoji 等增补平面字符按 3 token/个。"""
@@ -105,8 +105,42 @@ def estimate_tokens(text):
     normal = len(text) - cjk - astral - dense
     return int(cjk / 1.2 + normal / 3.5 + dense / 1.8 + astral * 3)
 
+# ── 精确分词（彻底方案）：从模型服务器同步的同款 tokenizer.json，裁剪预算用真实 token 数 ──
+# 字符估算在真实混合语料上实测偏低 12%（JSON转义stdout类内容偏低 20%），这正是
+# 预防性裁剪"看起来没超窗、实际已爆"的根源。有精确分词器后预算零漂移。
+_TOKENIZER = None
+_TOKENIZER_TRIED = False
+def _load_tokenizer():
+    global _TOKENIZER, _TOKENIZER_TRIED
+    if _TOKENIZER_TRIED: return _TOKENIZER
+    _TOKENIZER_TRIED = True
+    try:
+        d = os.environ.get('GA_TOKENIZER_DIR') or os.path.join(_ROOT, 'temp', 'qwen_tokenizer')
+        p = os.path.join(d, 'tokenizer.json')
+        if os.path.exists(p):
+            from tokenizers import Tokenizer  # 可选依赖：pip install tokenizers；缺失则退回字符估算
+            _TOKENIZER = Tokenizer.from_file(p)
+            print(f'[Info] Exact tokenizer loaded: {p} (trim budgets now use real token counts)')
+    except Exception as e:
+        print(f'[WARN] Exact tokenizer unavailable, falling back to char estimate: {e}')
+    return _TOKENIZER
+
+def count_tokens(text):
+    """有精确分词器则数真实 token，否则退回字符估算。"""
+    if not text: return 0
+    tok = _load_tokenizer()
+    if tok is None: return estimate_tokens(text)
+    return len(tok.encode(text, add_special_tokens=False).ids)
+
+_MSG_TOK_CACHE = {}
 def _msg_tokens(m):
-    return estimate_tokens(json.dumps(m, ensure_ascii=False)) + 10  # role/结构开销
+    s = json.dumps(m, ensure_ascii=False)
+    v = _MSG_TOK_CACHE.get(s)
+    if v is None:
+        v = count_tokens(s) + 10  # role/结构开销（chat template 每消息约 +4，10 留余量）
+        if len(_MSG_TOK_CACHE) > 5000: _MSG_TOK_CACHE.clear()
+        _MSG_TOK_CACHE[s] = v
+    return v
 
 def _clamp_oversized_blocks(history, token_budget, keep_from=0):
     """最后防线：逐条截断超大文本块；仍超预算则从最早的可删消息整体丢弃（至少留 2 条）。"""
@@ -132,11 +166,12 @@ def is_ctx_overflow_error(text):
     return isinstance(text, str) and text.lstrip().startswith(('!!!Error:', '[Error:')) and bool(_CTX_OVERFLOW_RE.search(text))
 
 def trim_messages_history(history, sess, force=False):
-    # 预算按估算 token 计（旧版按字符×3，中文场景严重低估，曾导致 262K 窗口被撑爆）
+    # 预算按真实 token 计（有 tokenizer 时精确计数；旧版按字符×3 曾把 262K 窗口撑爆，
+    # 纯字符估算在混合语料上实测偏低 12%，依然会在 229K~239K 死亡区间漏判）
     # 服务端按 prompt+max_tokens 合计校验窗口（SGLang/vLLM 均如此），预算必须先扣回复额度；
     # 之前没扣，导致 context_win=240000+max_tokens=32768 超过 262144，落入 229K~239K 的请求必被 400
     reserve = min(getattr(sess, 'max_tokens', 0) or 0, sess.context_win // 4)
-    cap = max(1024, sess.context_win - estimate_tokens(sess.system or '') - reserve - 1024)
+    cap = max(1024, sess.context_win - count_tokens(sess.system or '') - reserve - 1024)
     target = int(cap * (0.45 if force else getattr(sess, 'trim_keep_rate', 0.6)))
     kp = getattr(sess, 'trim_keep_prefix', 0)
     def cost(ms): return sum(_msg_tokens(m) for m in ms)
