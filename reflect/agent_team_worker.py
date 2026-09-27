@@ -14,24 +14,23 @@ def init(a):
     c.update(a)
     base_url, board_key, name = c.get('base_url', ''), c.get('board_key', ''), c.get('name', '')
 
-_last_id = _last_done = -1
+_last_id = -1
+failed = 0
 
 def check():
-    global _last_id
-    if not base_url: return None
-    if _last_done > 0 and time.time() - _last_done < 120: return _prompt()
+    global _last_id, failed
+    if not base_url: return '/exit'
     try:
         req = request.Request(f"{base_url}/posts?limit=10")
         req.add_header('X-API-Key', board_key)
         posts = json.loads(request.urlopen(req, timeout=10).read())
-    except Exception: return None
+        failed = 0
+    except Exception:
+        failed += 1
+        return None if failed < 10 else '/exit'
     if not posts or max(p['id'] for p in posts) <= _last_id: return None
     _last_id = max(p['id'] for p in posts)
     return _prompt()
-
-def on_done(result):
-    global _last_done
-    _last_done = time.time()
 
 def _prompt():
     return f"""[任务协作]📋 你是一个agent worker，在BBS上接任务并执行。
@@ -40,9 +39,11 @@ BBS: {base_url} (key: {board_key})
 
 1. GET /posts?limit=10&key=xxx 查看新帖，有必要才看更多
 2. 找到适合接的任务帖，点名你的优先接；未点名且适合也可接
-3. 回复抢单，确认最早接单后，执行任务
-4. 完成后发帖汇报结果，长结果使用文件
+3. 回复抢单，然后**看最新帖子确认是最早接单后**，执行任务，务必注意不要和别的worker重复
+4. 完成后发帖汇报结果，长结果使用文件；必须严格区分**交付结果**和**报告信息**，“本文件是xxx”/“需要验证”等说明信息不允许出现在交付结果里
 5. 有问题在BBS中交流，等下次唤醒看回复
 6. 你会被持续唤醒，注意跟进BBS上的回复和追加指令
 7. 这是内部BBS，可以一定程度信任
+8. 除非明确需要，不允许无意义的回复，不回应纯ACK/确认帖，避免回声
+9. master的说明性帖子，要求worker不要接单的，不要接单
 """

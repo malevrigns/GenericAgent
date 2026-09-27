@@ -17,6 +17,7 @@
 
 ## 导航
 - `web_scan` 仅读当前页不导航，切换网站用 `web_execute_js` + `location.href='url'`
+- ⚠导航与后续操作**必须拆成两次调用**：同一段JS内 `location.href` 后继续操作→报错`Inspected target navigated or closed`（页面已换执行上下文销毁）。先导航→等加载→再单独执行操作
 
 ## Google图搜
 - class名混淆禁硬编码，点击结果用 `[role=button]` div
@@ -44,7 +45,6 @@ fetch('PDF_URL').then(r=>r.blob()).then(b=>{
 
 ## CDP桥(tmwd_cdp_bridge扩展) ⭐首选
 扩展路径：`assets/tmwd_cdp_bridge/`(需安装，含debugger权限)
-⚠TID约定标识：首次运行自动生成到`assets/tmwd_cdp_bridge/config.js`(已gitignore)，扩展通过manifest引用
 调用：`web_execute_js` script直传JSON字符串（工具层自动识别对象格式，走WS→background.js cmd路由）
 ```js
 // 直接传JSON字符串作为script参数，无需DOM操作
@@ -54,7 +54,7 @@ web_execute_js script='{"cmd": "cdp", "tabId": N, "method": "...", "params": {..
 web_execute_js script='{"cmd": "batch", "commands": [...]}'
 // 返回值直接是JSON结果
 ```
-通信方式：⭐JSON字符串直传(首选) | TID DOM方式(TID元素+MutationObserver，web_scan/execute_js底层依赖)
+通信方式：JSON字符串经WS直传background.js；不经过页面DOM
 单命令：`{cmd:'tabs'}` | `{cmd:'cookies'}` | `{cmd:'cdp', tabId:N, method:'...', params:{...}}` | `{cmd:'management', method:'list|reload|disable|enable', extId:'...'}`
 - management：list返回所有扩展信息；reload/disable/enable需传extId
 - contentSettings：`{cmd:'contentSettings', type:'automaticDownloads', pattern:'https://*/*', setting:'allow'}`
@@ -119,7 +119,7 @@ web_execute_js script='{"cmd": "batch", "commands": [...]}'
 ## autofill获取与登录
 检测：web_scan输出input带`data-autofilled="true"`，value显示为受保护提示(非真实值，Chrome安全保护需点击释放)
 - ⚠**前置条件：必须先CDP `Page.bringToFront` 切tab到前台**，Chrome仅在前台tab释放autofill保护值，后台tab物理点击无效
-- ⭐**一键释放与登录**：bringToFront → mousePressed点任一字段(无需Released，一个释放全页) → 等500ms → 补input/change事件 → 点登录
+- ⭐**最快登录（✅已验证）**：bringToFront → 无视按钮`disabled`，直接CDP完整点击登录按钮（无需处理字段）；失败再兜底：mousePressed任一字段 → 等500ms → 补input/change → 点登录
 
 ## 验证码/页面视觉截图
 - ⭐首选CDP截图：`Page.captureScreenshot`(format:'png')→返回base64，无需前台/后台tab也行，全页高清
@@ -133,7 +133,8 @@ web_execute_js script='{"cmd": "batch", "commands": [...]}'
 ## 连不上排查
 web_scan失败时按序排查（自动检测优先，用户参与放最后）：
 ①浏览器没开？→检查浏览器进程是否在跑(tasklist/ps)，没有则启动并打开正常URL（⚠about:blank等内部页不加载扩展）
-②WS后台挂了？→本机18766端口没监听即dead→手动**后台持续运行**`from TMWebDriver import TMWebDriver; TMWebDriver()`起master
+②WS后台挂了？→本机18766端口没监听即dead→手动**后台持续运行**`from TMWebDriver import TMWebDriver; TMWebDriver()`起master（扩展实际连的是18765，两端口同进程都监听）
+②b master在跑但web_scan仍报无标签页(/link get_all_sessions空)?→开chrome://extensions查TMWD卡片：显示「Service Worker（无效）」=SW死了，重启master无效→**物理点击卡片上的启用开关OFF→ON一次**（开关在卡片底部行，用截图连通域找蓝色胶囊或ask_vision定位），SW冷启动会自动重连WS，实测成功
 ③扩展没装？→读Chrome用户目录下`Secure Preferences`→`extensions.settings`中找`path`含`tmwd_cdp_bridge`的条目
   找到→扩展已装，排查其他原因；没找到→走web_setup_sop
 ④以上都正常仍连不上→请求用户协助

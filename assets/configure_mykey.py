@@ -7,6 +7,7 @@ GenericAgent — 交互式初始化向导 (configure.py)
     python configure.py
 """
 
+import ast
 import os
 import sys
 import re
@@ -28,42 +29,66 @@ MYKPY_PATH = os.path.join(PROJECT_ROOT, 'mykey.py')
 # ── 模型厂商定义 ───────────────────────────────────────────────────────────
 
 LLM_PROVIDERS = [
-    # ═══════════════════════════ 直连 API（按旗舰能力降序）═══════════════════════════
+    # ═══════════════════════════ 通用协议（官方直连或任意兼容中转）═══════════════════════════
     {
-        'id': 'anthropic',
-        'name': 'Anthropic Claude 官方直连',
-        'desc': 'Claude Opus #1 最强模型，原生 tool 协议，sk-ant- 开头',
-        'type': 'native_claude',
-        'template': {
-            'name': 'anthropic-direct', 'apikey': 'sk-ant-<your-anthropic-key>',
-            'apibase': 'https://api.anthropic.com', 'model': 'claude-opus-4-7',
-            'thinking_type': 'adaptive', 'max_tokens': 32768, 'temperature': 1,
-        },
-        'key_hint': '在 https://console.anthropic.com/ 获取',
-        'model_choices': ['claude-opus-4-7', 'claude-sonnet-4-6'],
-    },
-    {
-        'id': 'openai',
-        'name': 'OpenAI GPT-5.5 / o 系列',
-        'desc': 'GPT-5.5 旗舰，与 Claude Opus 同级',
+        'id': 'oai_chat',
+        'name': 'OpenAI Chat Completions 协议',
+        'desc': '官方直连或任意 OAI 兼容中转/网关，自填 apibase（回车=OpenAI 官方）',
         'type': 'native_oai',
         'template': {
-            'name': 'gpt-native', 'apikey': 'sk-<your-openai-key>',
+            'name': 'gpt-native', 'apikey': 'sk-<your-key>',
             'apibase': 'https://api.openai.com/v1', 'model': 'gpt-5.5',
             'api_mode': 'chat_completions', 'reasoning_effort': 'high',
             'max_retries': 3, 'connect_timeout': 10, 'read_timeout': 120,
         },
-        'key_hint': '在 https://platform.openai.com/api-keys 获取',
+        'key_hint': '官方在 https://platform.openai.com/api-keys 获取；中转站填其提供的 Key',
         'model_choices': ['gpt-5.5', 'gpt-5.4'],
+        'extra_fields': [
+            {'key': 'apibase', 'label': 'API Base（官方或中转地址）', 'default': 'https://api.openai.com/v1'},
+        ],
     },
+    {
+        'id': 'oai_responses',
+        'name': 'OpenAI Responses 协议',
+        'desc': 'Responses API（o 系列/GPT-5.5 推荐端点），官方或兼容网关，自填 apibase',
+        'type': 'native_oai',
+        'template': {
+            'name': 'gpt-responses', 'apikey': 'sk-<your-key>',
+            'apibase': 'https://api.openai.com/v1', 'model': 'gpt-5.5',
+            'api_mode': 'responses', 'reasoning_effort': 'high',
+            'max_retries': 3, 'connect_timeout': 10, 'read_timeout': 120,
+        },
+        'key_hint': '官方在 https://platform.openai.com/api-keys 获取；中转站填其提供的 Key',
+        'model_choices': ['gpt-5.5', 'gpt-5.4'],
+        'extra_fields': [
+            {'key': 'apibase', 'label': 'API Base（官方或中转地址）', 'default': 'https://api.openai.com/v1'},
+        ],
+    },
+    {
+        'id': 'claude_messages',
+        'name': 'Claude Messages 协议',
+        'desc': 'Anthropic 官方直连或任意 Claude 兼容中转，自填 apibase（回车=官方）',
+        'type': 'native_claude',
+        'template': {
+            'name': 'anthropic-direct', 'apikey': 'sk-ant-<your-key>',
+            'apibase': 'https://api.anthropic.com', 'model': 'claude-opus-4-7',
+            'thinking_type': 'adaptive', 'max_tokens': 32768, 'temperature': 1,
+        },
+        'key_hint': '官方在 https://console.anthropic.com/ 获取；中转站填其提供的 Key',
+        'model_choices': ['claude-opus-4-7', 'claude-sonnet-4-6'],
+        'extra_fields': [
+            {'key': 'apibase', 'label': 'API Base（官方或中转地址）', 'default': 'https://api.anthropic.com'},
+        ],
+    },
+    # ═══════════════════════════ 直连 API（按旗舰能力降序）═══════════════════════════
     {
         'id': 'deepseek',
         'name': 'DeepSeek (v4-Pro / Flash)',
-        'desc': '最强开源模型，v4-Pro 旗舰 1M 上下文',
+        'desc': '开源模型，v4-Pro 旗舰 1M 上下文',
         'type': 'native_oai',
         'template': {
             'name': 'deepseek', 'apikey': 'sk-<your-deepseek-key>',
-            'apibase': 'https://api.deepseek.com', 'model': 'deepseek-v4-flash',
+            'apibase': 'https://api.deepseek.com', 'model': 'deepseek-v4-pro',
             'api_mode': 'chat_completions', 'reasoning_effort': 'high',
         },
         'key_hint': '在 https://platform.deepseek.com/api_keys 获取',
@@ -72,7 +97,7 @@ LLM_PROVIDERS = [
     {
         'id': 'kimi',
         'name': 'Kimi (k2.6 / k2.5) 双协议',
-        'desc': '月之暗面，国内顶尖，支持 Anthropic 和 OAI 双协议',
+        'desc': '月之暗面，支持 Anthropic 和 OAI 双协议',
         'type': 'native_claude',
         'template': {
             'name': 'kimi', 'apikey': 'sk-kimi-<your-key>',
@@ -101,11 +126,11 @@ LLM_PROVIDERS = [
         'template': {
             'name': 'qwen', 'apikey': 'sk-<your-dashscope-key>',
             'apibase': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-            'model': 'qwen3.5-plus',
+            'model': 'qwen3.6-max-preview',
             'api_mode': 'chat_completions',
         },
         'key_hint': '在 https://bailian.console.aliyun.com/ 获取 API Key',
-        'model_choices': ['qwen3.5-plus', 'qwen3-coder-plus'],
+        'model_choices': ['qwen3.6-max-preview', 'qwen3.5-plus', 'qwen3-coder-plus'],
         'extra_fields': [
             {
                 'key': '_endpoint', 'label': '选择端点',
@@ -144,16 +169,16 @@ LLM_PROVIDERS = [
     },
     {
         'id': 'minimax',
-        'name': 'MiniMax M2.7 (双协议)',
-        'desc': 'MiniMax M2.7，支持 Anthropic 和 OpenAI 双协议',
+        'name': 'MiniMax M3 (双协议)',
+        'desc': 'MiniMax M3，支持 Anthropic 和 OpenAI 双协议',
         'type': 'native_claude',
         'template': {
             'name': 'minimax', 'apikey': 'eyJh...<your-minimax-key>',
             'apibase': 'https://api.minimaxi.com/anthropic',
-            'model': 'MiniMax-M2.7', 'max_retries': 3,
+            'model': 'MiniMax-M3', 'max_retries': 3,
         },
         'key_hint': '在 https://platform.minimaxi.com/user-center/basic-information 获取',
-        'model_choices': ['MiniMax-M2.7', 'MiniMax-M2.5'],
+        'model_choices': ['MiniMax-M3', 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed'],
         'extra_fields': [
             {
                 'key': '_protocol', 'label': '选择 API 协议',
@@ -296,6 +321,21 @@ LLM_PROVIDERS = [
             'max_retries': 3, 'connect_timeout': 10, 'read_timeout': 120,
         },
         'key_hint': '在 https://openrouter.ai/keys 获取',
+        'model_choices': ['anthropic/claude-opus-4-7', 'openai/gpt-5.5'],
+    },
+    {
+        'id': 'commonstack',
+        'name': 'CommonStack (统一网关)',
+        'desc': '一个 Key 通吃 Claude/GPT/Gemini/DeepSeek/MiniMax/Zhipu/xAI 等',
+        'type': 'native_oai',
+        'template': {
+            'name': 'commonstack', 'apikey': 'sk-<your-commonstack-key>',
+            'apibase': 'https://api.commonstack.ai/v1',
+            'model': 'anthropic/claude-opus-4-7',
+            'api_mode': 'chat_completions',
+            'max_retries': 3, 'connect_timeout': 10, 'read_timeout': 120,
+        },
+        'key_hint': '在 https://commonstack.ai 注册后从 Dashboard 获取 API Key',
         'model_choices': ['anthropic/claude-opus-4-7', 'openai/gpt-5.5'],
     },
     {
@@ -692,7 +732,7 @@ def _configure_advanced(provider, cfg):
     proxy = ask_input("HTTP 代理地址 (proxy)", default='', hint='如 http://127.0.0.1:2082，留空跳过')
     if proxy:
         cfg['proxy'] = proxy
-    cw = ask_input("上下文窗口阈值 (context_win)", default='', hint='NativeClaude 默认 28000，其他默认 24000')
+    cw = ask_input("上下文窗口阈值 (context_win)", default='', hint='默认 30000，DeepSeek 默认 70000；联动压缩与工具上限')
     if cw:
         cfg['context_win'] = int(cw)
     if cfg.get('thinking_type') == 'enabled':
@@ -857,6 +897,8 @@ def configure_platforms():
 
         if pid == 'feishu' and ask_yesno("使用一键扫码创建应用？（推荐）", default=True):
             env_vals = _feishu_scan(platform)
+        if pid == 'wechat' and ask_yesno("扫码登录微信 iLink？（推荐）", default=True):
+            env_vals = _wechat_scan()
 
         for var in platform['env_vars']:
             if var['key'] not in env_vals:
@@ -946,6 +988,39 @@ def _feishu_scan(platform):
         return {}
 
 
+def _wechat_scan():
+    """微信 iLink 扫码登录，保存 token 到 ~/.wxbot/token.json，返回 env_vals"""
+    print(f"\n  {C['cyan']}📱 正在启动微信 iLink 扫码登录...{C['reset']}")
+    print(f"  {C['dim']}  请用微信扫描终端二维码，完成授权后自动获取凭据。{C['reset']}\n")
+
+    # 确保项目根在路径中，以便导入 frontends/wechatapp
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+    try:
+        from frontends.wechatapp import WxBotClient
+    except ImportError as e:
+        print(f"\n  {C['yellow']}⚠ 无法导入 WxBotClient: {e}{C['reset']}")
+        return {}
+
+    try:
+        bot = WxBotClient()
+        if bot.token:
+            print(f"  {C['green']}✅ 已有有效 token (bot_id={bot.bot_id}){C['reset']}")
+            if ask_yesno("重新扫码登录？", default=False):
+                bot.token = ''
+            else:
+                return {}
+        bot.login_qr()
+        print(f"\n  {C['green']}✅ 微信 iLink 扫码登录成功！{C['reset']}")
+        print(f"  Bot ID: {C['bold']}{bot.bot_id}{C['reset']}")
+        print(f"  Token 已保存到: {C['dim']}{bot._tf}{C['reset']}")
+    except Exception as e:
+        print(f"\n  {C['red']}✗ 扫码登录失败: {e}{C['reset']}")
+        return {}
+
+    return {}
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  生成 mykey.py
@@ -1033,7 +1108,7 @@ def generate_mykey(llm_cfgs, platform_configs):
 
 def _write_config_fields(lines, cfg):
     """写入配置字典的键值对（缩进的 'key': value, 格式）"""
-    for key in ['name', 'apikey', 'apibase', 'model', 'api_mode',
+    for key in ['name', 'type', 'apikey', 'apibase', 'model', 'api_mode',
                 'fake_cc_system_prompt', 'thinking_type', 'thinking_budget_tokens',
                 'reasoning_effort', 'max_tokens', 'max_retries', 'connect_timeout',
                 'read_timeout', 'temperature', 'context_win',
@@ -1066,7 +1141,7 @@ def _write_platform_value(lines, key, val):
 def _parse_existing_mykey():
     """解析已有 mykey.py，返回 (model_names, platform_infos)
 
-    llm_cfgs: [{'name': str, 'type': str, ...}]  — 模型配置字典列表
+    model_names: [str]  — 模型名列表
     platform_infos: [{'id': str, 'vars': [{'key': str, 'val': ...}]}]  — 平台信息
     解析失败时返回 ([], [])
     """
@@ -1082,19 +1157,79 @@ def _parse_existing_mykey():
     if m:
         model_names = re.findall(r"'([^']+)'", m.group(1))
 
-    # 解析平台变量 → 平台 ID
-    platform_id_map = {
-        'tg_bot_token': 'telegram', 'qq_app_id': 'qq',
-        'fs_app_id': 'feishu', 'wecom_bot_id': 'wecom',
-        'dingtalk_client_id': 'dingtalk', 'dc_bot_token': 'discord',
-    }
+    # 先收集所有已知平台 env var key → 判断值类型
+    all_env_var_keys = {}
+    platform_env_keys = {}  # pid -> [var_key]
+    for p in PLATFORMS:
+        pid = p['id']
+        platform_env_keys.setdefault(pid, [])
+        for var in p.get('env_vars', []):
+            vkey = var['key']
+            all_env_var_keys[vkey] = var
+            platform_env_keys[pid].append(vkey)
+
+    # 逐平台解析所有已知变量
     platform_infos = []
-    for var_key, pid in platform_id_map.items():
-        m_var = re.search(rf"^{var_key}\s*=\s*'([^']*)'", content, re.MULTILINE)
-        if m_var:
-            platform_infos.append({'id': pid, 'vars': [{'key': var_key, 'val': m_var.group(1)}]})
+    for pid, env_keys in platform_env_keys.items():
+        vars_found = []
+        for vkey in env_keys:
+            var_def = all_env_var_keys[vkey]
+            val = None
+            if var_def.get('is_list'):
+                # 匹配 `xxx = [...]`
+                m_var = re.search(rf"^{vkey}\s*=\s*(\[[^\]]*\])", content, re.MULTILINE)
+                if m_var:
+                    try:
+                        val = ast.literal_eval(m_var.group(1))
+                    except (ValueError, SyntaxError):
+                        pass
+            else:
+                # 匹配 `xxx = '...'`
+                m_var = re.search(rf"^{vkey}\s*=\s*'([^']*)'", content, re.MULTILINE)
+                if m_var:
+                    val = m_var.group(1)
+            if val is not None:
+                vars_found.append({'key': vkey, 'val': val})
+        if vars_found:
+            platform_infos.append({'id': pid, 'vars': vars_found})
 
     return model_names, platform_infos
+
+
+def _parse_existing_llm_cfgs():
+    """解析已有 mykey.py，返回完整 LLM 配置字典列表 [{name, apikey, ...}]
+    解析失败时返回 []
+    """
+    if not os.path.exists(MYKPY_PATH):
+        return []
+
+    with open(MYKPY_PATH, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    cfgs = []
+    # 匹配所有 `xxx = {  ...  }` 顶层字典赋值
+    # 用简单状态机: 找 `\w+ = {` 然后匹配花括号
+    pattern = re.compile(r'^(\w+)\s*=\s*\{', re.MULTILINE)
+    for m in pattern.finditer(content):
+        brace_start = m.end() - 1  # '{' 的位置
+        depth = 1
+        i = brace_start + 1
+        while i < len(content) and depth > 0:
+            if content[i] == '{':
+                depth += 1
+            elif content[i] == '}':
+                depth -= 1
+            i += 1
+        if depth == 0:
+            dict_text = content[m.end():i - 1]
+            try:
+                d = ast.literal_eval('{' + dict_text + '}')
+                if isinstance(d, dict) and 'name' in d:
+                    cfgs.append(d)
+            except (ValueError, SyntaxError):
+                continue
+
+    return cfgs
 
 
 def _backup_with_name(model_names, platform_ids):
@@ -1107,6 +1242,8 @@ def _backup_with_name(model_names, platform_ids):
         if pid_clean not in parts:
             parts.append(pid_clean)
     safe_name = '_'.join(parts)
+    if safe_name == 'mykey':
+        safe_name = 'mykey_backup'  # 避免和源文件同名
     if len(safe_name) > 100:
         safe_name = safe_name[:100]
     backup_path = os.path.join(PROJECT_ROOT, f'{safe_name}.py')
@@ -1154,7 +1291,7 @@ def main():
 
         if mode == 'new':
             backup_path = _backup_with_name(model_names, [p['id'] for p in platform_infos])
-            print(f"  {C['green']}✓ 旧配置已备份至:{C['reset']} {C['dim']}{backup}{C['reset']}")
+            print(f"  {C['green']}✓ 旧配置已备份至:{C['reset']} {C['dim']}{backup_path}{C['reset']}")
             is_new = True
         else:
             is_modify = True
@@ -1177,8 +1314,12 @@ def main():
                         config_dict = {v['key']: v['val'] for v in pi['vars']}
                         platform_configs.append({'platform': p, 'config': config_dict})
             elif scope == 'platform' and model_names:
-                print(f"\n  {C['yellow']}⚠ 只修改平台时若未提供 LLM 配置将无法使用。{C['reset']}")
-                cprint(f"    建议两项都重新配置。", 'dim')
+                old_cfgs = _parse_existing_llm_cfgs()
+                if old_cfgs:
+                    llm_cfgs = old_cfgs
+                    print(f"\n  {C['green']}✓ 已保留现有 LLM 配置: {', '.join(c['name'] for c in old_cfgs)}{C['reset']}")
+                else:
+                    print(f"\n  {C['yellow']}⚠ 保留 LLM 配置失败，将生成空配置。建议两项都重新配置。{C['reset']}")
 
     if not is_modify:
         if is_new:
@@ -1210,6 +1351,12 @@ def main():
             platform_configs, platform_deps = configure_platforms()
             if ask_yesno("是否继续配置 LLM 模型？", default=True):
                 llm_cfgs = _do_llm()
+            elif os.path.exists(MYKPY_PATH):
+                # 新建+仅平台：从备份保留旧 LLM 配置
+                old_cfgs = _parse_existing_llm_cfgs()
+                if old_cfgs:
+                    llm_cfgs = old_cfgs
+                    print(f"\n  {C['green']}✓ 已保留备份中的 LLM 配置: {', '.join(c['name'] for c in old_cfgs)}{C['reset']}")
 
     # ── 生成 mykey.py ──
     if not llm_cfgs and not platform_configs:
@@ -1218,10 +1365,9 @@ def main():
 
     content = generate_mykey(llm_cfgs, platform_configs)
 
-    # 备份旧文件
-    if os.path.exists(MYKPY_PATH):
-        backup = os.path.join(PROJECT_ROOT, f'mykey.py.bak.{datetime.now().strftime("%Y%m%d_%H%M%S")}')
-        shutil.copy2(MYKPY_PATH, backup)
+    # 备份旧文件（修改模式不备份，直接在原文件修改）
+    if os.path.exists(MYKPY_PATH) and not is_modify and not is_new:
+        backup = _backup_with_name(model_names, [p['id'] for p in platform_infos])
         print(f"\n  {C['green']}✓ 旧配置已备份至:{C['reset']} {C['dim']}{backup}{C['reset']}")
 
     # 写入

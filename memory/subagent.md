@@ -1,40 +1,38 @@
 # Subagent 调用 SOP
 
-## 文件IO协议
+## 两种模式
 
-- 目录：`temp/{task_name}/`（cwd在temp/时即`./{task_name}/`）
-- 启动：`python agentmain.py --task {name} [--input "短文本"] [--llm_no N]`（cwd=代码根）
+### --func 纯函数模式
+- `python agentmain.py --func prompt.txt [--llm_no N]`（cwd=代码根）
+- 读prompt文件→执行→结果写`prompt.out.txt`→退出，主agent读完可删
+- 后台启动(print PID)，加`--nobg`前台同步等结果
+- 适用：单次任务、并行map、不需要追问的场景
+
+### --task 持续协作模式
+- `python agentmain.py --task {name} [--input "短文本"] [--llm_no N]`（cwd=代码根）
 - `--input`自动建目录+清旧output+写input.txt；长文本先手动写input.txt再启动(不带--input)
-- 自动后台启动，print PID then exit
-- subagent的cwd还是temp，不是task目录
+- **不要--nobg**（会卡在等reply循环），只能后台启动
+- 通信：output.txt(`[ROUND END]`=轮完成) → 写reply.txt继续 → 不写10min退出。reply后输出为output1/2/3.txt
+- 干预文件：`_stop`(当轮结束) | `_keyinfo`(注入working memory) | `_intervene`(追加指令)
+- [[可选fork]]：将变量history(str)写入task目录下`_history.json`继承对话上下文
+- [[可选监察者]]：主agent空闲时读output观察进度，必要时干预文件纠偏。加`--verbose`可审查原始数据
+
+## 共通规则
+- 所有agent的cwd=temp，方便文件共享
 - input：目标+约束即可，subagent同等智能。**禁写步骤/过度描述**，大量数据给路径
-- 可选fork功能（继承对话上下文）: code_run(inline_eval=True)，将变量history（自动注入,str）写入task目录下_history.json
-- 通信：output.txt(append,`[ROUND END]`=轮完成) → 写reply.txt继续 → 不写10min退出。reply后输出为output1/2/3.txt(同格式)
-- 干预文件：`_stop`(当轮结束退出) | `_keyinfo`(注入working memory) | `_intervene`(追加指令)
-- 监察模式：**主agent空闲时应读output观察进度，必要时用干预文件纠偏，禁止无脑长时间sleep**
-- 若加`--verbose`，output将包含工具执行结果，主agent可直接审查原始数据而非仅信任摘要
 
 ## 场景1：测试模式 - 行为验证
 **用途**：观察agent真实行为，修正RULES/L2/L3/SOP
-**流程**：创建test_path/写input.txt→启动subagent→轮询output.txt(2秒间隔)→验证→清理重复
-**测试原则**：只给目标，不提示位置/不诱导做法，观察自主选择
-**修正闭环**：发现问题→设计测试→定位根源(RULES/L2/L3/SOP)→patch修正→验证
-**技术要点**：Insight优先级>SOP；subagent的cwd=temp/
+**流程**：写prompt→启动subagent→轮询结果→验证→清理
+**原则**：只给目标，不提示位置/不诱导做法；Insight优先级>SOP；subagent的cwd=temp/
 **两种测试**：
-- 测SOP质量：input指定SOP名（如"用ezgmail_sop查看最近3封未读邮件"），排除导航干扰，失败即SOP问题
-- 测导航能力：input只写目标，验证subagent能自主从insight找到正确SOP。禁止内联SOP内容
+- 测SOP质量：input指定SOP名，排除导航干扰，失败即SOP问题
+- 测导航能力：input只写目标，验证能自主从insight找到正确SOP
 
 ## 场景2：Map模式 - 并行处理
-**用途**：将N个独立同构子任务分发给各自的subagent处理
-**核心优势**：独立上下文。避免处理文档A的长上下文污染处理文档B的质量
-**约束**：
-- 文件系统共享是优点：不同agent处理不同输入文件，产生不同输出文件
-- 共享资源冲突：键鼠不可共享；浏览器暂时不可并行使用，避免同时操作同一标签页
-- 不满足map模式的任务 → 主agent顺序执行即可，别用subagent
-**标准流程（map-reduce）**：
-1. 主agent准备阶段：爬取/dump数据，存为多个独立输入文件
-2. 分发：对每个文件启动一个subagent处理（主agent自己也可以处理其中一个）
-3. 收集：等所有subagent完成，主agent读取各输出文件，汇总结果
+**用途**：N个独立同构子任务分发，独立上下文避免交叉污染
+**约束**：文件系统共享(优点)；键鼠不可共享；浏览器避免同tab
+**流程**：准备独立输入文件→每个启动subagent(--func优先)→收集输出汇总
 **⚠ --func会self-daemon**：Popen启动后原PID立即退出属正常(它fork出worker)，**禁用tasklist查原PID判断存活**。判完成=轮询`prompt.out.txt`出现`[ROUND END]`(或目标产物文件生成)。LLM写大文件较慢,单任务可达2-5min,别误判为卡死就重复重跑;某out.txt长期停在中间Turn无[ROUND END]=该实例真挂了,单独重跑即可。
 **⚠ 拼装LLM生成的HTML/CSS片段易破版**：子片段里的`<style>`块可能未闭合/错位/裸写CSS,只删配对`<style>`会漏CSS泄漏进body致标签失衡。稳健做法:按"首个`<style>`到最后一个`</style>`"整段抽为CSS并入head,body取最后`</style>`之后内容;拼完校验各标签开闭配平+body内无`.xxx{`裸选择器。
 
